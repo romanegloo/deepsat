@@ -5,17 +5,13 @@ from __future__ import print_function
 import re
 
 import tensorflow as tf
+import ds_input
 
-FLAGS = tf.app.flags.FLAGS
+flags = tf.app.flags
+FLAGS = flags.FLAGS
 
 IMAGE_SIZE = 28
 NUM_CLASSES = 6
-NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 324000
-NUM_EXAMPLES_PER_EPOCH_FOR_EVAL = 81000
-
-# Basic model parameters.
-tf.app.flags.DEFINE_integer('batch_size', 128,
-                            """Number of images to process in a batch.""")
 
 # If a model is trained with multiple GPUs, prefix all Op names with tower_name
 # to differentiate the operations. Note that this prefix is removed from the
@@ -148,3 +144,130 @@ def inference(images):
     _activation_summary(softmax_linear)
 
   return softmax_linear
+
+def loss(logits, labels):
+  """Add L2Loss to all the trainable variables.
+
+  Add summary for "Loss" and "Loss/avg".
+  Args:
+    logits: Logits from inference().
+    labels: Labels from distorted_inputs or inputs(). 1-D tensor
+            of shape [batch_size]
+
+  Returns:
+    Loss tensor of type float.
+  """
+  # Calculate the average cross entropy loss across the batch.
+  labels = tf.cast(labels, tf.int64)
+  cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
+      logits, labels, name='cross_entropy_per_example')
+  cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
+  tf.add_to_collection('losses', cross_entropy_mean)
+
+  # The total loss is defined as the cross entropy loss plus all of the weight
+  # decay terms (L2 loss).
+  return tf.add_n(tf.get_collection('losses'), name='total_loss')
+
+
+def training(loss, learning_rate):
+  """Sets up the training Ops.
+
+  Creates a summarizer to track the loss over time in TensorBoard.
+
+  Creates an optimizer and applies the gradients to all trainable variables.
+
+  The Op returned by this function is what must be passed to the
+  `sess.run()` call to cause the model to train.
+
+  Args:
+    loss: Loss tensor, from loss().
+    learning_rate: The learning rate to use for gradient descent.
+
+  Returns:
+    train_op: The Op for training.
+  """
+  # Add a scalar summary for the snapshot loss.
+  tf.scalar_summary(loss.op.name, loss)
+  # Create the gradient descent optimizer with the given learning rate.
+  optimizer = tf.train.GradientDescentOptimizer(learning_rate)
+  # Create a variable to track the global step.
+  global_step = tf.Variable(0, name='global_step', trainable=False)
+  # Use the optimizer to apply the gradients that minimize the loss
+  # (and also increment the global step counter) as a single training step.
+  train_op = optimizer.minimize(loss, global_step=global_step)
+  return train_op
+
+
+def evaluation(logits, labels):
+  """Evaluate the quality of the logits at predicting the label.
+
+  Args:
+    logits: Logits tensor, float - [batch_size, NUM_CLASSES].
+    labels: Labels tensor, int32 - [batch_size], with values in the
+      range [0, NUM_CLASSES).
+
+  Returns:
+    A scalar int32 tensor with the number of examples (out of batch_size)
+    that were predicted correctly.
+  """
+  # For a classifier model, we can use the in_top_k Op.
+  # It returns a bool tensor with shape [batch_size] that is true for
+  # the examples where the label is in the top k (here k=1)
+  # of all logits for that example.
+  correct = tf.nn.in_top_k(logits, labels, 1)
+  # Return the number of true entries.
+  return tf.reduce_sum(tf.cast(correct, tf.int32))
+
+def do_eval(sess,
+            eval_correct,
+            images_placeholder,
+            labels_placeholder,
+            data_set):
+  """Runs one evaluation against the full epoch of data.
+
+  Args:
+    sess: The session in which the model has been trained.
+    eval_correct: The Tensor that returns the number of correct predictions.
+    images_placeholder: The images placeholder.
+    labels_placeholder: The labels placeholder.
+    data_set: The set of images and labels to evaluate, from
+      input_data.read_data_sets().
+  """
+  # And run one epoch of eval.
+  true_count = 0  # Counts the number of correct predictions.
+  steps_per_epoch = data_set.num_examples // FLAGS.batch_size
+  num_examples = steps_per_epoch * FLAGS.batch_size
+  for step in xrange(steps_per_epoch):
+    feed_dict = ds_input.fill_feed_dict(data_set,
+                               images_placeholder,
+                               labels_placeholder)
+    true_count += sess.run(eval_correct, feed_dict=feed_dict)
+  precision = true_count / num_examples
+  print('  Num examples: %d  Num correct: %d  Precision @ 1: %0.04f' %
+        (num_examples, true_count, precision))
+
+def _add_loss_summaries(total_loss):
+  """Add summaries for losses in CIFAR-10 model.
+
+  Generates moving average for all losses and associated summaries for
+  visualizing the performance of the network.
+
+  Args:
+    total_loss: Total loss from loss().
+  Returns:
+    loss_averages_op: op for generating moving averages of losses.
+  """
+  # Compute the moving average of all individual losses and the total loss.
+  loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
+  losses = tf.get_collection('losses')
+  loss_averages_op = loss_averages.apply(losses + [total_loss])
+
+  # Attach a scalar summary to all individual losses and the total loss; do the
+  # same for the averaged version of the losses.
+  for l in losses + [total_loss]:
+    # Name each loss as '(raw)' and name the moving average version of the loss
+    # as the original loss name.
+    tf.scalar_summary(l.op.name +' (raw)', l)
+    tf.scalar_summary(l.op.name, loss_averages.average(l))
+
+  return loss_averages_op
