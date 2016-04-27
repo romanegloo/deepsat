@@ -2,38 +2,14 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import re
+import math
 
 import tensorflow as tf
-import ds_input
 
-flags = tf.app.flags
-FLAGS = flags.FLAGS
-
+# The DEEPSAT dataset has 6 classes, representing the digits 0 through 6.
+NUM_CLASSES = 6 
 IMAGE_SIZE = 28
-NUM_CLASSES = 6
-
-# If a model is trained with multiple GPUs, prefix all Op names with tower_name
-# to differentiate the operations. Note that this prefix is removed from the
-# names of the summaries when visualizing a model.
-TOWER_NAME = 'tower'
-
-def _activation_summary(x):
-  """Helper to create summaries for activations.
-
-  Creates a summary that provides a histogram of activations.
-  Creates a summary that measure the sparsity of activations.
-
-  Args:
-    x: Tensor
-  Returns:
-    nothing
-  """
-  # Remove 'tower_[0-9]/' from the name in case this is a multi-GPU training
-  # session. This helps the clarity of presentation on tensorboard.
-  tensor_name = re.sub('%s_[0-9]*/' % TOWER_NAME, '', x.op.name)
-  tf.histogram_summary(tensor_name + '/activations', x)
-  tf.scalar_summary(tensor_name + '/sparsity', tf.nn.zero_fraction(x))
+IMAGE_PIXELS = IMAGE_SIZE * IMAGE_SIZE
 
 def _variable_on_cpu(name, shape, initializer):
   """Helper to create a Variable stored on CPU memory.
@@ -74,13 +50,6 @@ def _variable_with_weight_decay(name, shape, stddev, wd):
   return var
 
 def inference(images):
-  """Build deepsat model."""
-  # We instantiate all variables using tf.get_variable() instead of
-  # tf.Variable() in order to share variables across multiple GPU training runs.
-  # If we only ran this model on a single GPU, we could simplify this function
-  # by replacing all instances of tf.get_variable() with tf.Variable().
-  #
-  images = tf.cast(images, tf.float32)
   # conv1
   with tf.variable_scope('conv1') as scope:
     kernel = _variable_with_weight_decay('weights', shape=[5, 5, 3, 64],
@@ -89,7 +58,7 @@ def inference(images):
     biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.0))
     bias = tf.nn.bias_add(conv, biases)
     conv1 = tf.nn.relu(bias, name=scope.name)
-    #_activation_summary(conv1)
+    _activation_summary(conv1)
 
   # pool1
   pool1 = tf.nn.max_pool(conv1, ksize=[1, 3, 3, 1], strides=[1, 2, 2, 1],
@@ -106,7 +75,7 @@ def inference(images):
     biases = _variable_on_cpu('biases', [64], tf.constant_initializer(0.1))
     bias = tf.nn.bias_add(conv, biases)
     conv2 = tf.nn.relu(bias, name=scope.name)
-    #_activation_summary(conv2)
+    _activation_summary(conv2)
 
   # norm2
   norm2 = tf.nn.lrn(conv2, 4, bias=1.0, alpha=0.001 / 9.0, beta=0.75,
@@ -124,7 +93,7 @@ def inference(images):
                                           stddev=0.04, wd=0.004)
     biases = _variable_on_cpu('biases', [384], tf.constant_initializer(0.1))
     local3 = tf.nn.relu(tf.matmul(reshape, weights) + biases, name=scope.name)
-    #_activation_summary(local3)
+    _activation_summary(local3)
 
   # local4
   with tf.variable_scope('local4') as scope:
@@ -132,7 +101,7 @@ def inference(images):
                                           stddev=0.04, wd=0.004)
     biases = _variable_on_cpu('biases', [192], tf.constant_initializer(0.1))
     local4 = tf.nn.relu(tf.matmul(local3, weights) + biases, name=scope.name)
-    #_activation_summary(local4)
+    _activation_summary(local4)
 
   # softmax, i.e. softmax(WX + b)
   with tf.variable_scope('softmax_linear') as scope:
@@ -141,39 +110,69 @@ def inference(images):
     biases = _variable_on_cpu('biases', [NUM_CLASSES],
                               tf.constant_initializer(0.0))
     softmax_linear = tf.add(tf.matmul(local4, weights), biases, name=scope.name)
-    #_activation_summary(softmax_linear)
+    _activation_summary(softmax_linear)
 
   return softmax_linear
 
-def loss(logits, labels):
-  """Add L2Loss to all the trainable variables.
+def inference_fcn(images):
+  """Build the DEEPSAT model up to where it may be used for inference.
 
-  Add summary for "Loss" and "Loss/avg".
   Args:
-    logits: Logits from inference().
-    labels: Labels from distorted_inputs or inputs(). 1-D tensor
-            of shape [batch_size]
+    images: Images placeholder, from inputs().
+    hidden1_units: Size of the first hidden layer.
+    hidden2_units: Size of the second hidden layer.
 
   Returns:
-    Loss tensor of type float.
+    softmax_linear: Output tensor with the computed logits.
+  """
+  hidden1_units = 128
+  hidden2_units = 32
+
+  # Hidden 1
+  with tf.name_scope('hidden1'):
+    weights = tf.Variable(
+        tf.truncated_normal([IMAGE_PIXELS, hidden1_units],
+                            stddev=1.0 / math.sqrt(float(IMAGE_PIXELS))),
+        name='weights')
+    biases = tf.Variable(tf.zeros([hidden1_units]),
+                         name='biases')
+    hidden1 = tf.nn.relu(tf.matmul(images, weights) + biases)
+  # Hidden 2
+  with tf.name_scope('hidden2'):
+    weights = tf.Variable(
+        tf.truncated_normal([hidden1_units, hidden2_units],
+                            stddev=1.0 / math.sqrt(float(hidden1_units))),
+        name='weights')
+    biases = tf.Variable(tf.zeros([hidden2_units]),
+                         name='biases')
+    hidden2 = tf.nn.relu(tf.matmul(hidden1, weights) + biases)
+  # Linear
+  with tf.name_scope('softmax_linear'):
+    weights = tf.Variable(
+        tf.truncated_normal([hidden2_units, NUM_CLASSES],
+                            stddev=1.0 / math.sqrt(float(hidden2_units))),
+        name='weights')
+    biases = tf.Variable(tf.zeros([NUM_CLASSES]),
+                         name='biases')
+    logits = tf.matmul(hidden2, weights) + biases
+  return logits
+
+
+def loss(logits, labels):
+  """Calculates the loss from the logits and the labels.
+
+  Args:
+    logits: Logits tensor, float - [batch_size, NUM_CLASSES].
+    labels: Labels tensor, int32 - [batch_size].
+
+  Returns:
+    loss: Loss tensor of type float.
   """
   labels = tf.to_int64(labels)
   cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      logits, labels, name='cross_entropy_per_example')
-  loss = tf.reduce_mean(cross_entropy, name="cross_entropy_mean")
+      logits, labels, name='xentropy')
+  loss = tf.reduce_mean(cross_entropy, name='xentropy_mean')
   return loss
-
-  # below from CIFAR10 example
-  # Calculate the average cross entropy loss across the batch.
-  # labels = tf.cast(labels, tf.int64)
-  # cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(
-      # logits, labels, name='cross_entropy_per_example')
-  # cross_entropy_mean = tf.reduce_mean(cross_entropy, name='cross_entropy')
-  # tf.add_to_collection('losses', cross_entropy_mean)
-
-  # # The total loss is defined as the cross entropy loss plus all of the weight
-  # # decay terms (L2 loss).
-  # return tf.add_n(tf.get_collection('losses'), name='total_loss')
 
 
 def training(loss, learning_rate):
@@ -194,14 +193,11 @@ def training(loss, learning_rate):
     train_op: The Op for training.
   """
   # Add a scalar summary for the snapshot loss.
-  # tf.scalar_summary(loss.op.name, loss)
-
+  tf.scalar_summary(loss.op.name, loss)
   # Create the gradient descent optimizer with the given learning rate.
   optimizer = tf.train.GradientDescentOptimizer(learning_rate)
-
   # Create a variable to track the global step.
   global_step = tf.Variable(0, name='global_step', trainable=False)
-
   # Use the optimizer to apply the gradients that minimize the loss
   # (and also increment the global step counter) as a single training step.
   train_op = optimizer.minimize(loss, global_step=global_step)
@@ -227,57 +223,3 @@ def evaluation(logits, labels):
   correct = tf.nn.in_top_k(logits, labels, 1)
   # Return the number of true entries.
   return tf.reduce_sum(tf.cast(correct, tf.int32))
-
-def do_eval(sess,
-            eval_correct,
-            images_placeholder,
-            labels_placeholder,
-            data_set):
-  """Runs one evaluation against the full epoch of data.
-
-  Args:
-    sess: The session in which the model has been trained.
-    eval_correct: The Tensor that returns the number of correct predictions.
-    images_placeholder: The images placeholder.
-    labels_placeholder: The labels placeholder.
-    data_set: The set of images and labels to evaluate, from
-      input_data.read_data_sets().
-  """
-  # And run one epoch of eval.
-  true_count = 0  # Counts the number of correct predictions.
-  steps_per_epoch = data_set.num_examples // FLAGS.batch_size
-  num_examples = steps_per_epoch * FLAGS.batch_size
-  for step in xrange(steps_per_epoch):
-    feed_dict = ds_input.fill_feed_dict(data_set,
-                               images_placeholder,
-                               labels_placeholder)
-    true_count += sess.run(eval_correct, feed_dict=feed_dict)
-  precision = true_count / num_examples
-  print('  Num examples: %d  Num correct: %d  Precision @ 1: %0.04f' %
-        (num_examples, true_count, precision))
-
-def _add_loss_summaries(total_loss):
-  """Add summaries for losses in CIFAR-10 model.
-
-  Generates moving average for all losses and associated summaries for
-  visualizing the performance of the network.
-
-  Args:
-    total_loss: Total loss from loss().
-  Returns:
-    loss_averages_op: op for generating moving averages of losses.
-  """
-  # Compute the moving average of all individual losses and the total loss.
-  loss_averages = tf.train.ExponentialMovingAverage(0.9, name='avg')
-  losses = tf.get_collection('losses')
-  loss_averages_op = loss_averages.apply(losses + [total_loss])
-
-  # Attach a scalar summary to all individual losses and the total loss; do the
-  # same for the averaged version of the losses.
-  for l in losses + [total_loss]:
-    # Name each loss as '(raw)' and name the moving average version of the loss
-    # as the original loss name.
-    tf.scalar_summary(l.op.name +' (raw)', l)
-    tf.scalar_summary(l.op.name, loss_averages.average(l))
-
-  return loss_averages_op
