@@ -49,7 +49,7 @@ def _variable_with_weight_decay(name, shape, stddev, wd):
     tf.add_to_collection('losses', weight_decay)
   return var
 
-def inference(images):
+def inference_conv(images):
   # conv1
   with tf.variable_scope('conv1') as scope:
     kernel = _variable_with_weight_decay('weights', shape=[5, 5, 3, 64],
@@ -114,7 +114,7 @@ def inference(images):
 
   return softmax_linear
 
-def inference_fcn(images):
+def inference(images):
   """Build the DEEPSAT model up to where it may be used for inference.
 
   Args:
